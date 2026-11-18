@@ -4,17 +4,6 @@ import book_service
 
 bp = Blueprint("books", __name__)
 
-
-def book_json(book):
-    return {
-        "id": book["id"],
-        "title": book["title"],
-        "author": book["author"],
-        "isbn": book["isbn"],
-        "available": bool(book["available"]),
-    }
-
-
 @bp.route("/books", methods=["GET"])
 def list_books():
     only_available = request.args.get("available") == "true"
