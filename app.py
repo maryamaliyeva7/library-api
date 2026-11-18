@@ -14,7 +14,13 @@ import book_repository
 import loan_repository
 import report_repository
 
+import fines
+from errors import LibraryError
+
 app = Flask(__name__)
+@app.errorhandler(LibraryError)
+def handle_library_error(error):
+    return jsonify({"error": error.message}), error.status
 app.register_blueprint(books_bp)
 app.register_blueprint(members_bp)
 app.register_blueprint(loans_bp)
