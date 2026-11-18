@@ -10,6 +10,10 @@ from routers.loans import bp as loans_bp
 import db
 from db import init_db
 
+import book_repository
+import loan_repository
+import report_repository
+
 app = Flask(__name__)
 app.register_blueprint(books_bp)
 app.register_blueprint(members_bp)
@@ -17,6 +21,49 @@ app.register_blueprint(loans_bp)
 
 
 # ---------- books ----------
+
+def book_json(book):
+    return {"id": book["id"], "title": book["title"], "author": book["author"], "isbn": book["isbn"], "available": bool(book["available"])}
+
+
+@app.route("/books", methods=["GET"])
+def list_books():
+    rows = book_repository.list_books(request.args.get("available") == "true")
+    result = []
+    for r in rows:
+        result.append(book_json(r))
+    return jsonify(result)
+
+
+@app.route("/books/<int:book_id>", methods=["GET"])
+def get_book(book_id):
+    r = book_repository.get_book(book_id)
+    if r is None:
+        return jsonify({"error": "book not found"}), 404
+    return jsonify(book_json(r))
+
+
+@app.route("/books", methods=["POST"])
+def create_book():
+    data = request.get_json(silent=True) or {}
+    if not data.get("title") or not data.get("author"):
+        return jsonify({"error": "title and author are required"}), 400
+    if not check(data.get("isbn"), "isbn"):
+        return jsonify({"error": "invalid isbn"}), 400
+    r = book_repository.create_book(data["title"], data["author"], data["isbn"])
+    return jsonify(book_json(r)), 201
+
+
+@app.route("/books/<int:book_id>", methods=["DELETE"])
+def delete_book(book_id):
+    r = book_repository.get_book(book_id)
+    if r is None:
+        return jsonify({"error": "book not found"}), 404
+    if r["available"] == 0:
+        return jsonify({"error": "book is on loan"}), 409
+    book_repository.delete_book(book_id)
+    return "", 204
+
 
 # ---------- members ----------
 
@@ -27,17 +74,7 @@ app.register_blueprint(loans_bp)
 
 @app.route("/reports/overdue", methods=["GET"])
 def report_overdue():
-    conn = db.connect()
-    rows = conn.execute(
-        """
-        SELECT loans.id, books.title, members.name, loans.due_date
-        FROM loans
-        JOIN books ON books.id = loans.book_id
-        JOIN members ON members.id = loans.member_id
-        WHERE loans.returned = 0
-        """
-    ).fetchall()
-    conn.close()
+    rows = report_repository.list_open_loans_with_details()
     items = []
     total = 0
     for r in rows:
@@ -53,10 +90,8 @@ def report_overdue():
 
 @app.route("/reports/summary", methods=["GET"])
 def report_summary():
-    conn = db.connect()
-    total_books = conn.execute("SELECT COUNT(*) FROM books").fetchone()[0]
-    rows = conn.execute("SELECT * FROM loans").fetchall()
-    conn.close()
+    total_books = book_repository.count_books()
+    rows = loan_repository.list_loans()
     on_loan = 0
     outstanding = 0
     for loan in rows:

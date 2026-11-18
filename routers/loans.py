@@ -1,11 +1,13 @@
-import sqlite3
 from datetime import date, timedelta
 
 from flask import Blueprint, jsonify, request
+
+import book_repository
+import loan_repository
+import member_repository
 from utils import check, money
 
 bp = Blueprint("loans", __name__)
-
 
 CURRENT_MEMBER = None
 
@@ -23,33 +25,30 @@ def notify(kind, title="", send=True):
         subject = "Library notice"
         body = title
     with open("outbox.txt", "a") as f:
-        f.write("TO: " + CURRENT_MEMBER[2] + " | SUBJECT: " + subject + " | BODY: " + body + "\n")
+        f.write("TO: " + CURRENT_MEMBER["email"] + " | SUBJECT: " + subject + " | BODY: " + body + "\n")
 
 
 @bp.route("/loans", methods=["GET"])
 def list_loans():
-    conn = sqlite3.connect("library.db")
-    rows = conn.execute("SELECT * FROM loans").fetchall()
-    conn.close()
     result = []
-    for loan in rows:
-        current_fine = loan[5]
-        days_late = (date.today() - date.fromisoformat(loan[3])).days
-        if loan[4] == 0:
+    for loan in loan_repository.list_loans():
+        current_fine = loan["fine"]
+        days_late = (date.today() - date.fromisoformat(loan["due_date"])).days
+        if loan["returned"] == 0:
             current_fine = max(0, days_late) * 0.50
-        if request.args.get("overdue") == "true" and (loan[4] == 1 or days_late <= 0):
+        if request.args.get("overdue") == "true" and (loan["returned"] == 1 or days_late <= 0):
             continue
         result.append(
             {
-                "id": loan[0],
-                "book_id": loan[1],
-                "member_id": loan[2],
-                "due_date": loan[3],
-                "returned": bool(loan[4]),
-                "fine": money(loan[5]),
-                "fine_paid": bool(loan[6]),
-                "renewals": loan[7],
-                "checked_out": loan[8],
+                "id": loan["id"],
+                "book_id": loan["book_id"],
+                "member_id": loan["member_id"],
+                "due_date": loan["due_date"],
+                "returned": bool(loan["returned"]),
+                "fine": money(loan["fine"]),
+                "fine_paid": bool(loan["fine_paid"]),
+                "renewals": loan["renewals"],
+                "checked_out": loan["checked_out"],
                 "current_fine": money(current_fine),
             }
         )
@@ -58,26 +57,24 @@ def list_loans():
 
 @bp.route("/loans/<int:loan_id>", methods=["GET"])
 def get_loan(loan_id):
-    conn = sqlite3.connect("library.db")
-    loan = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
-    conn.close()
+    loan = loan_repository.get_loan(loan_id)
     if loan is None:
         return jsonify({"error": "loan not found"}), 404
-    current_fine = loan[5]
-    if loan[4] == 0:
-        days_late = (date.today() - date.fromisoformat(loan[3])).days
+    current_fine = loan["fine"]
+    if loan["returned"] == 0:
+        days_late = (date.today() - date.fromisoformat(loan["due_date"])).days
         current_fine = max(0, days_late) * 0.50
     return jsonify(
         {
-            "id": loan[0],
-            "book_id": loan[1],
-            "member_id": loan[2],
-            "due_date": loan[3],
-            "returned": bool(loan[4]),
-            "fine": money(loan[5]),
-            "fine_paid": bool(loan[6]),
-            "renewals": loan[7],
-            "checked_out": loan[8],
+            "id": loan["id"],
+            "book_id": loan["book_id"],
+            "member_id": loan["member_id"],
+            "due_date": loan["due_date"],
+            "returned": bool(loan["returned"]),
+            "fine": money(loan["fine"]),
+            "fine_paid": bool(loan["fine_paid"]),
+            "renewals": loan["renewals"],
+            "checked_out": loan["checked_out"],
             "current_fine": money(current_fine),
         }
     )
@@ -92,66 +89,54 @@ def create_loan():
     if data.get("due_date") and not check(data["due_date"], "date"):
         return jsonify({"error": "invalid due_date"}), 400
 
-    conn = sqlite3.connect("library.db")
-    book = conn.execute("SELECT * FROM books WHERE id = ?", (data["book_id"],)).fetchone()
+    book = book_repository.get_book(data["book_id"])
     if book is None:
-        conn.close()
         return jsonify({"error": "book not found"}), 404
-    member = conn.execute("SELECT * FROM members WHERE id = ?", (data["member_id"],)).fetchone()
+    member = member_repository.get_member(data["member_id"])
     if member is None:
-        conn.close()
         return jsonify({"error": "member not found"}), 404
-    if book[4] == 0:
-        conn.close()
+    if book["available"] == 0:
         return jsonify({"error": "book is not available"}), 409
 
-    rows = conn.execute("SELECT * FROM loans WHERE member_id = ?", (data["member_id"],)).fetchall()
+    rows = loan_repository.list_loans_for_member(data["member_id"])
     owed = 0
     open_loans = 0
     for loan in rows:
-        if loan[4] == 0:
+        if loan["returned"] == 0:
             open_loans += 1
-            days_late = (date.today() - date.fromisoformat(loan[3])).days
+            days_late = (date.today() - date.fromisoformat(loan["due_date"])).days
             if days_late > 0:
                 owed += days_late * 0.5
-        elif loan[6] == 0:
-            owed += loan[5]
+        elif loan["fine_paid"] == 0:
+            owed += loan["fine"]
     if owed > 0:
-        conn.close()
         return jsonify({"error": "member has unpaid fines"}), 409
-    limit = 3
-    if member[3] == "staff":
-        limit = 5
+    limit = 5 if member["type"] == "staff" else 3
     if open_loans >= limit:
-        conn.close()
         return jsonify({"error": "loan limit reached"}), 409
 
     today = date.today()
     due_date = data.get("due_date") or (today + timedelta(days=14)).isoformat()
-    cur = conn.execute(
-        "INSERT INTO loans (book_id, member_id, due_date, checked_out) VALUES (?, ?, ?, ?)",
-        (data["book_id"], data["member_id"], due_date, today.isoformat()),
+    loan = loan_repository.create_loan(
+        data["book_id"], data["member_id"], due_date, today.isoformat()
     )
-    conn.execute("UPDATE books SET available = 0 WHERE id = ?", (data["book_id"],))
-    conn.commit()
-    loan = conn.execute("SELECT * FROM loans WHERE id = ?", (cur.lastrowid,)).fetchone()
-    conn.close()
+    book_repository.set_availability(data["book_id"], False)
 
     CURRENT_MEMBER = member
-    notify("checkout", book[1])
+    notify("checkout", book["title"])
 
     return (
         jsonify(
             {
-                "id": loan[0],
-                "book_id": loan[1],
-                "member_id": loan[2],
-                "due_date": loan[3],
-                "returned": bool(loan[4]),
-                "fine": money(loan[5]),
-                "fine_paid": bool(loan[6]),
-                "renewals": loan[7],
-                "checked_out": loan[8],
+                "id": loan["id"],
+                "book_id": loan["book_id"],
+                "member_id": loan["member_id"],
+                "due_date": loan["due_date"],
+                "returned": bool(loan["returned"]),
+                "fine": money(loan["fine"]),
+                "fine_paid": bool(loan["fine_paid"]),
+                "renewals": loan["renewals"],
+                "checked_out": loan["checked_out"],
             }
         ),
         201,
@@ -160,42 +145,35 @@ def create_loan():
 
 @bp.route("/loans/<int:loan_id>/return", methods=["POST"])
 def return_book(loan_id):
-    conn = sqlite3.connect("library.db")
-    loan = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
+    loan = loan_repository.get_loan(loan_id)
     if loan is None:
-        conn.close()
         return jsonify({"error": "loan not found"}), 404
-    if loan[4] == 1:
-        conn.close()
+    if loan["returned"] == 1:
         return jsonify({"error": "loan already returned"}), 409
 
-    days_late = (date.today() - date.fromisoformat(loan[3])).days
+    days_late = (date.today() - date.fromisoformat(loan["due_date"])).days
     fine = max(0, days_late) * 0.50
-    conn.execute("UPDATE loans SET returned = 1, fine = ? WHERE id = ?", (fine, loan_id))
-    conn.execute("UPDATE books SET available = 1 WHERE id = ?", (loan[1],))
-    conn.commit()
-    member = conn.execute("SELECT * FROM members WHERE id = ?", (loan[2],)).fetchone()
-    book = conn.execute("SELECT * FROM books WHERE id = ?", (loan[1],)).fetchone()
-    updated = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
-    conn.close()
+    updated = loan_repository.mark_returned(loan_id, loan["book_id"], fine)
+    member = member_repository.get_member(loan["member_id"])
+    book = book_repository.get_book(loan["book_id"])
 
     with open("outbox.txt", "a") as f:
         f.write(
-            "TO: " + member[2] + " | SUBJECT: Book returned | BODY: You returned " + book[1]
+            "TO: " + member["email"] + " | SUBJECT: Book returned | BODY: You returned " + book["title"]
             + ". Fine: $" + str(money(fine)) + "\n"
         )
 
     return jsonify(
         {
-            "id": updated[0],
-            "book_id": updated[1],
-            "member_id": updated[2],
-            "due_date": updated[3],
-            "returned": bool(updated[4]),
-            "fine": money(updated[5]),
-            "fine_paid": bool(updated[6]),
-            "renewals": updated[7],
-            "checked_out": updated[8],
+            "id": updated["id"],
+            "book_id": updated["book_id"],
+            "member_id": updated["member_id"],
+            "due_date": updated["due_date"],
+            "returned": bool(updated["returned"]),
+            "fine": money(updated["fine"]),
+            "fine_paid": bool(updated["fine_paid"]),
+            "renewals": updated["renewals"],
+            "checked_out": updated["checked_out"],
         }
     )
 
@@ -203,83 +181,65 @@ def return_book(loan_id):
 @bp.route("/loans/<int:loan_id>/renew", methods=["POST"])
 def renew_loan(loan_id):
     global CURRENT_MEMBER
-    conn = sqlite3.connect("library.db")
-    loan = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
+    loan = loan_repository.get_loan(loan_id)
     if loan is None:
-        conn.close()
         return jsonify({"error": "loan not found"}), 404
-    if loan[4] == 1:
-        conn.close()
+    if loan["returned"] == 1:
         return jsonify({"error": "loan already returned"}), 409
-    if date.fromisoformat(loan[3]) < date.today():
-        conn.close()
+    if date.fromisoformat(loan["due_date"]) < date.today():
         return jsonify({"error": "overdue loans cannot be renewed"}), 409
-    if loan[7] >= 1:
-        conn.close()
+    if loan["renewals"] >= 1:
         return jsonify({"error": "loan was already renewed"}), 409
 
-    new_due = (date.fromisoformat(loan[3]) + timedelta(days=14)).isoformat()
-    conn.execute("UPDATE loans SET due_date = ?, renewals = renewals + 1 WHERE id = ?", (new_due, loan_id))
-    conn.commit()
-    CURRENT_MEMBER = conn.execute("SELECT * FROM members WHERE id = ?", (loan[2],)).fetchone()
-    book = conn.execute("SELECT * FROM books WHERE id = ?", (loan[1],)).fetchone()
-    updated = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
-    conn.close()
-
-    notify("renew", book[1])
+    new_due = (date.fromisoformat(loan["due_date"]) + timedelta(days=14)).isoformat()
+    updated = loan_repository.extend_loan(loan_id, new_due)
+    CURRENT_MEMBER = member_repository.get_member(loan["member_id"])
+    book = book_repository.get_book(loan["book_id"])
+    notify("renew", book["title"])
 
     return jsonify(
         {
-            "id": updated[0],
-            "book_id": updated[1],
-            "member_id": updated[2],
-            "due_date": updated[3],
-            "returned": bool(updated[4]),
-            "fine": money(updated[5]),
-            "fine_paid": bool(updated[6]),
-            "renewals": updated[7],
-            "checked_out": updated[8],
+            "id": updated["id"],
+            "book_id": updated["book_id"],
+            "member_id": updated["member_id"],
+            "due_date": updated["due_date"],
+            "returned": bool(updated["returned"]),
+            "fine": money(updated["fine"]),
+            "fine_paid": bool(updated["fine_paid"]),
+            "renewals": updated["renewals"],
+            "checked_out": updated["checked_out"],
         }
     )
 
 
 @bp.route("/loans/<int:loan_id>/pay-fine", methods=["POST"])
 def pay_fine(loan_id):
-    conn = sqlite3.connect("library.db")
-    loan = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
+    loan = loan_repository.get_loan(loan_id)
     if loan is None:
-        conn.close()
         return jsonify({"error": "loan not found"}), 404
-    if loan[4] == 0:
-        conn.close()
+    if loan["returned"] == 0:
         return jsonify({"error": "return the book before paying"}), 409
-    if loan[5] <= 0 or loan[6] == 1:
-        conn.close()
+    if loan["fine"] <= 0 or loan["fine_paid"] == 1:
         return jsonify({"error": "no fine to pay"}), 409
 
-    conn.execute("UPDATE loans SET fine_paid = 1 WHERE id = ?", (loan_id,))
-    conn.commit()
-    member = conn.execute("SELECT * FROM members WHERE id = ?", (loan[2],)).fetchone()
-    updated = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
-    conn.close()
-
+    updated = loan_repository.mark_fine_paid(loan_id)
+    member = member_repository.get_member(loan["member_id"])
     with open("outbox.txt", "a") as f:
         f.write(
-            "TO: " + member[2] + " | SUBJECT: Fine paid | BODY: We received $" + str(money(loan[5])) + "\n"
+            "TO: " + member["email"] + " | SUBJECT: Fine paid | BODY: We received $"
+            + str(money(loan["fine"])) + "\n"
         )
 
     return jsonify(
         {
-            "id": updated[0],
-            "book_id": updated[1],
-            "member_id": updated[2],
-            "due_date": updated[3],
-            "returned": bool(updated[4]),
-            "fine": money(updated[5]),
-            "fine_paid": bool(updated[6]),
-            "renewals": updated[7],
-            "checked_out": updated[8],
+            "id": updated["id"],
+            "book_id": updated["book_id"],
+            "member_id": updated["member_id"],
+            "due_date": updated["due_date"],
+            "returned": bool(updated["returned"]),
+            "fine": money(updated["fine"]),
+            "fine_paid": bool(updated["fine_paid"]),
+            "renewals": updated["renewals"],
+            "checked_out": updated["checked_out"],
         }
     )
-
-
